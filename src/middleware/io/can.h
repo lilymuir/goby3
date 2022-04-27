@@ -218,6 +218,63 @@ void goby::middleware::io::CanThread<line_in_group, line_out_group, publish_laye
                 goby::glog.is_debug1() && goby::glog << "Message already Queued in buffer to be written" << std::endl;
             }
         });
+
+    // subscribe to CAN fastpacket map 
+    this->interthread().template subscribe<line_out_group, std::map<int, can_frame>>(
+        [this](const std::map<int, can_frame>& fastpacket_buffer) {
+            bool add_to_write_buffer = false;
+            std::map<int, goby::middleware::protobuf::IOData> fastpacket_io_buffer;
+            for (const auto& fastpacket_pair : fastpacket_buffer){
+                
+                int fp_number = fastpacket_pair.first;
+                const auto& fastpacket_msg = fastpacket_pair.second;
+
+                auto io_msg = std::make_shared<goby::middleware::protobuf::IOData>();
+                std::string& bytes = *io_msg->mutable_data();
+
+                const int frame_size = sizeof(can_frame);
+
+                for (int i = 0; i < frame_size; ++i)
+                { bytes += *(reinterpret_cast<const char*>(&fastpacket_msg) + i); }
+                
+                // if any of the fastpackets are not in the write buffer, need to write them all
+                if (!add_to_write_buffer){
+                    // check current write outbox to see if message is already queued
+                    bool in_write_buffer = false; 
+                    for (int i = 0; i < write_outbox_.size(); ++i){
+                        if (write_outbox_[i].data() == io_msg->data() && !in_write_buffer){
+                            // this fp message is in the write buffer already, break loop
+                            in_write_buffer = true;
+                            break;
+                        }
+                    }
+                    if (!in_write_buffer){
+                        add_to_write_buffer = true;
+                    }
+                }
+                fastpacket_io_buffer[fp_number] = *io_msg;
+            }
+
+            // Only write fps to buffer if at least one is not in the buffer already
+            if (add_to_write_buffer){
+                // add fastpackets to buffer in order
+                for (int i = 0; i < fastpacket_io_buffer.size(); ++i){
+                    write_outbox_.push_back(fastpacket_io_buffer[i]);
+                }
+
+                // if fastpackets are only thing in buffer, call a write
+                if ( write_outbox_.size() == fastpacket_io_buffer.size() ) {
+                    auto io_msg = std::make_shared<goby::middleware::protobuf::IOData>(write_outbox_[0]);
+                    this->write(io_msg);
+                }
+                else{
+                    goby::glog.is_debug1() && goby::glog << "Outstanding write, adding fastpackets to buffer" << std::endl;
+                }
+            }
+            else{
+                goby::glog.is_debug1() && goby::glog << "Fastpacket Message already Queued in buffer to be written" << std::endl;
+            }
+        });
 }
 
 template <const goby::middleware::Group& line_in_group,
