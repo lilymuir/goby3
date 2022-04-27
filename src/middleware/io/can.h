@@ -4,6 +4,8 @@
 // File authors:
 //   Toby Schneider <toby@gobysoft.org>
 //   Shawn Dooley <shawn@shawndooley.net>
+// Modified by: 
+//   Lily Muir <lmuir414@gmail.com>
 //
 //
 // This file is part of the Goby Underwater Autonomy Project Libraries
@@ -37,10 +39,12 @@
 #include <sys/socket.h>    // for bind, setsockopt
 #include <tuple>           // for make_tuple, tuple
 #include <vector>          // for vector
+#include <deque>           // for fastpacket outbox queue
 
 #include <boost/asio/buffer.hpp>                  // for buffer
 #include <boost/asio/posix/stream_descriptor.hpp> // for stream_descriptor
 #include <boost/asio/read.hpp>                    // for async_read
+#include <boost/system/error_code.hpp>           // for error_code
 #include <boost/bind.hpp>                         // for bind
 #include <boost/core/ref.hpp>                     // for ref
 
@@ -112,17 +116,19 @@ class CanThread : public detail::IOThread<line_in_group, line_out_group, publish
 
   private:
     void async_read() override;
-    void async_write(std::shared_ptr<const goby::middleware::protobuf::IOData> io_msg) override
-    {
-        detail::basic_async_write(this, io_msg);
-    }
+    void async_write(std::shared_ptr<const goby::middleware::protobuf::IOData> io_msg) override;
 
     void open_socket() override;
 
     void data_rec(struct can_frame& receive_frame_, boost::asio::posix::stream_descriptor& stream);
 
   private:
+    typedef std::deque<goby::middleware::protobuf::IOData> Outbox;
+
+  private:
     struct can_frame receive_frame_;
+
+    Outbox write_outbox_; // need to ensure the fastpackets are sent back to back
 };
 } // namespace io
 } // namespace middleware
@@ -187,7 +193,30 @@ void goby::middleware::io::CanThread<line_in_group, line_out_group, publish_laye
             const int frame_size = sizeof(can_frame);
 
             for (int i = 0; i < frame_size; ++i)
-            { bytes += *(reinterpret_cast<const char*>(&frame) + i); } this->write(io_msg);
+            { bytes += *(reinterpret_cast<const char*>(&frame) + i); } 
+
+            // check current write outbox to see if message is already queued
+            bool in_write_buffer = false; 
+            for (int i = 0; i < write_outbox_.size(); ++i){
+                if (write_outbox_[i].data() == io_msg->data()){
+                    // this message is in the write buffer already, break loop
+                    in_write_buffer = true;
+                    break;
+                }
+            }
+            if (!in_write_buffer){
+                write_outbox_.push_back(*io_msg);
+
+                if ( write_outbox_.size() == 1 ) {
+                    this->write(io_msg);
+                }
+                else{
+                    goby::glog.is_debug1() && goby::glog << "Outstanding write, added message to outbox buffer" << std::endl;
+                }
+            }
+            else{
+                goby::glog.is_debug1() && goby::glog << "Message already Queued in buffer to be written" << std::endl;
+            }
         });
 }
 
@@ -227,6 +256,37 @@ void goby::middleware::io::CanThread<line_in_group, line_out_group, publish_laye
     boost::asio::async_read(
         stream, boost::asio::buffer(&receive_frame_, sizeof(receive_frame_)),
         boost::bind(&CanThread::data_rec, this, boost::ref(receive_frame_), boost::ref(stream)));
+}
+
+template <const goby::middleware::Group& line_in_group,
+          const goby::middleware::Group& line_out_group,
+          goby::middleware::io::PubSubLayer publish_layer,
+          goby::middleware::io::PubSubLayer subscribe_layer, template <class> class ThreadType>
+void goby::middleware::io::CanThread<line_in_group, line_out_group, publish_layer, subscribe_layer,
+                                     ThreadType>::async_write(std::shared_ptr<const goby::middleware::protobuf::IOData> io_msg)
+{
+    glog.is_debug2() && glog << "Size of buffer? " << write_outbox_.size() << std::endl;
+    boost::asio::async_write(
+        this->mutable_socket(), boost::asio::buffer(io_msg->data()),
+        // capture io_msg in callback to ensure write buffer exists until async_write is done
+        [this, io_msg](const boost::system::error_code& ec, std::size_t bytes_transferred) {
+            if (!ec && bytes_transferred > 0)
+            {
+                this->handle_write_success(bytes_transferred);
+            }
+            else
+            {
+                check_write_error(ec);
+            }
+            write_outbox_.pop_front();
+            glog.is_debug2() && glog << "Check Size of buffer? " << write_outbox_.size() << std::endl;
+            if ( !write_outbox_.empty() ) {
+                // send next message
+                auto io_msg = std::make_shared<goby::middleware::protobuf::IOData>(write_outbox_[0]);
+                this->write(io_msg);
+            }
+        }
+    );
 }
 
 #endif
