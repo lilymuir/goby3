@@ -117,6 +117,7 @@ class CanThread : public detail::IOThread<line_in_group, line_out_group, publish
   private:
     void async_read() override;
     void async_write(std::shared_ptr<const goby::middleware::protobuf::IOData> io_msg) override;
+    virtual void check_write_error(const boost::system::error_code& ec) {this->handle_write_error(ec);};
 
     void open_socket() override;
 
